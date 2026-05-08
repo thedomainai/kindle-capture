@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+vendor/
+.venv/
+__pycache__/
+
+# Environment & Secrets
+.env
+.env.*
+*.key
+*.pem
+secrets/
+
+# Build artifacts
+dist/
+build/
+*.o
+*.pyc
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Large files
+*.zip
+*.tar.gz
+*.dmg
+*.iso
+*.mp4
+*.mov
+
+# Claude Code
+*.proposed
+*.backup
+
+# Capture output
+captures/
