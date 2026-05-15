@@ -35,8 +35,12 @@ Thumbs.db
 *.mov
 
 # Claude Code
+.claude/
 *.proposed
 *.backup
 
 # Capture output
 captures/
+
+# Internal docs (not part of the application)
+docs/

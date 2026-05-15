@@ -3,11 +3,14 @@
 
 Run with Kindle open and a book displayed:
     python3 test_e2e.py
+    python3 test_e2e.py --direction ltr    # for horizontal books
+    python3 test_e2e.py --direction rtl    # for manga/vertical books
 
 Tests are sequential and interactive — each test describes what it does
 before executing, and reports pass/fail with diagnostic details.
 """
 
+import argparse
 import hashlib
 import os
 import subprocess
@@ -23,10 +26,12 @@ except ImportError:
 
 # Import functions from kindle_capture
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import kindle_capture as kc
 from kindle_capture import (
     find_kindle_window, is_kindle_running, activate_kindle,
     capture_window, pixel_hash, capture_and_hash, wait_for_stable_frame,
     send_page_turn, _send_page_back, _safe_remove,
+    probe_navigation_keys,
 )
 
 PASS = 0
@@ -47,16 +52,29 @@ def report(name, ok, detail="", warn=False):
         print("  FAIL  {} — {}".format(name, detail))
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="E2E diagnostic tests for kindle_capture")
+    parser.add_argument("--direction", choices=["auto", "rtl", "ltr"], default="auto",
+                        help="Reading direction (default: auto)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print debug information")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+    direction = args.direction
+
     print("=" * 60)
     print("Kindle Capture — E2E Diagnostic Tests")
+    print("  direction: {}".format(direction))
     print("=" * 60)
     print()
 
     # ------------------------------------------------------------------
     # Test 1: Kindle process
     # ------------------------------------------------------------------
-    print("[1/8] Kindle process running")
+    print("[1/9] Kindle process running")
     running = is_kindle_running()
     report("Process check", running,
            "Kindle is running" if running else "Kindle not found — start Kindle first")
@@ -67,7 +85,7 @@ def main():
     # ------------------------------------------------------------------
     # Test 2: Window detection
     # ------------------------------------------------------------------
-    print("\n[2/8] Window detection")
+    print("\n[2/9] Window detection")
     window = find_kindle_window()
     if window:
         report("Window found", True,
@@ -81,7 +99,7 @@ def main():
     # ------------------------------------------------------------------
     # Test 3: Screenshot capture
     # ------------------------------------------------------------------
-    print("\n[3/8] Screenshot capture")
+    print("\n[3/9] Screenshot capture")
     fd, tmp = tempfile.mkstemp(suffix=".png")
     os.close(fd)
     ok = capture_window(wid, tmp)
@@ -95,7 +113,7 @@ def main():
     # ------------------------------------------------------------------
     # Test 4: Pixel hash decode
     # ------------------------------------------------------------------
-    print("\n[4/8] Pixel hash (bitmap decode)")
+    print("\n[4/9] Pixel hash (bitmap decode)")
     fd, tmp = tempfile.mkstemp(suffix=".png")
     os.close(fd)
     capture_window(wid, tmp)
@@ -115,7 +133,7 @@ def main():
     # ------------------------------------------------------------------
     # Test 5: Pixel hash stability across captures (same window, no action)
     # ------------------------------------------------------------------
-    print("\n[5/8] Pixel hash stability (two captures, 0.5s apart)")
+    print("\n[5/9] Pixel hash stability (two captures, 0.5s apart)")
     tmp1, hash1 = capture_and_hash(wid)
     time.sleep(0.5)
     tmp2, hash2 = capture_and_hash(wid)
@@ -138,7 +156,7 @@ def main():
     # ------------------------------------------------------------------
     # Test 6: Frame stabilization
     # ------------------------------------------------------------------
-    print("\n[6/8] Frame stabilization (wait_for_stable_frame)")
+    print("\n[6/9] Frame stabilization (wait_for_stable_frame)")
     t0 = time.time()
     stable = wait_for_stable_frame(wid, timeout=4.0, interval=0.3)
     elapsed = time.time() - t0
@@ -150,70 +168,98 @@ def main():
                "timeout after {:.1f}s — window content keeps changing".format(elapsed))
 
     # ------------------------------------------------------------------
-    # Test 7: Page turn changes content
+    # Test 7: Navigation key probing
     # ------------------------------------------------------------------
-    print("\n[7/8] Page turn (right arrow key)")
-    before = wait_for_stable_frame(wid, timeout=3.0)
-    if not before:
-        report("Page turn", False, "could not get stable frame before turn")
+    print("\n[7/9] Navigation key probe (direction={})".format(direction))
+    activate_kindle()
+    time.sleep(0.5)
+    nav_result = probe_navigation_keys(wid, direction=direction, verbose=args.verbose)
+    nav_ok = True
+    if nav_result:
+        fwd, bwd, name = nav_result
+        report("Navigation probe", True,
+               "forward=key {}, backward=key {}, method={}".format(fwd, bwd, name))
     else:
-        send_page_turn()
-        time.sleep(1.0)
-        after = wait_for_stable_frame(wid, timeout=4.0)
-        if after and after != before:
-            report("Content changed after turn", True)
-            # Turn back
-            _send_page_back()
+        if direction == "auto":
+            report("Navigation probe", False,
+                   "both arrows change page — direction ambiguous. "
+                   "Use --direction rtl or --direction ltr")
+            nav_ok = False
+        else:
+            report("Navigation probe", True,
+                   "using {} arrow keys (no probe needed)".format(direction.upper()))
+
+    # ------------------------------------------------------------------
+    # Test 8: Page turn changes content
+    # ------------------------------------------------------------------
+    if not nav_ok:
+        print("\n[8/9] Page turn — SKIPPED (direction ambiguous)")
+        print("[9/9] Multiple page turns — SKIPPED (direction ambiguous)")
+        print("\n  Tip: Navigate Kindle to the FIRST page for auto-detection,")
+        print("       or specify --direction rtl / --direction ltr")
+    else:
+        nav_desc = kc._nav_key_name if kc._nav_key_name else (
+            "left arrow (RTL)" if direction == "rtl" else "right arrow (LTR)")
+        print("\n[8/9] Page turn ({})".format(nav_desc))
+        before = wait_for_stable_frame(wid, timeout=3.0)
+        if not before:
+            report("Page turn", False, "could not get stable frame before turn")
+        else:
+            send_page_turn(direction=direction)
             time.sleep(1.0)
-            restored = wait_for_stable_frame(wid, timeout=3.0)
-            if restored == before:
-                report("Restored after turn-back", True)
+            after = wait_for_stable_frame(wid, timeout=4.0)
+            if after and after != before:
+                report("Content changed after turn", True)
+                # Turn back
+                _send_page_back(direction=direction)
+                time.sleep(1.0)
+                restored = wait_for_stable_frame(wid, timeout=3.0)
+                if restored == before:
+                    report("Restored after turn-back", True)
+                else:
+                    report("Restored after turn-back", False,
+                           "hash differs from original", warn=True)
             else:
-                report("Restored after turn-back", False,
-                       "hash differs from original", warn=True)
-        else:
-            report("Content changed after turn", False,
-                   "page did not change — is a book open?")
+                report("Content changed after turn", False,
+                       "page did not change — is a book open?")
 
-    # ------------------------------------------------------------------
-    # Test 8: Multiple consecutive page turns
-    # ------------------------------------------------------------------
-    print("\n[8/8] Multiple page turns (3 pages forward, 3 back)")
-    hashes = []
-    base = wait_for_stable_frame(wid, timeout=3.0)
-    if base:
-        hashes.append(base)
+        # ------------------------------------------------------------------
+        # Test 9: Multiple consecutive page turns
+        # ------------------------------------------------------------------
+        print("\n[9/9] Multiple page turns (3 pages forward, 3 back)")
+        hashes = []
+        base = wait_for_stable_frame(wid, timeout=3.0)
+        if base:
+            hashes.append(base)
 
-    forward_ok = True
-    for i in range(3):
-        send_page_turn()
-        time.sleep(1.0)
-        h = wait_for_stable_frame(wid, timeout=4.0)
-        if h is None:
-            report("Forward turn {}".format(i + 1), False, "stabilization failed")
-            forward_ok = False
-            break
-        if h in hashes:
-            # We've seen this page before — we went backwards or looped
-            idx = hashes.index(h)
-            report("Forward turn {}".format(i + 1), False,
-                   "page matches earlier page #{} — backward navigation?".format(idx))
-            forward_ok = False
-            break
-        hashes.append(h)
-        report("Forward turn {}".format(i + 1), True, "new page (unique hash)")
-
-    if forward_ok:
-        # Turn back 3 times
+        forward_ok = True
         for i in range(3):
-            _send_page_back()
+            send_page_turn(direction=direction)
             time.sleep(1.0)
-        restored = wait_for_stable_frame(wid, timeout=3.0)
-        if restored == base:
-            report("Returned to original page", True)
-        else:
-            report("Returned to original page", False,
-                   "hash differs", warn=True)
+            h = wait_for_stable_frame(wid, timeout=4.0)
+            if h is None:
+                report("Forward turn {}".format(i + 1), False, "stabilization failed")
+                forward_ok = False
+                break
+            if h in hashes:
+                idx = hashes.index(h)
+                report("Forward turn {}".format(i + 1), False,
+                       "page matches earlier page #{} — backward navigation?".format(idx))
+                forward_ok = False
+                break
+            hashes.append(h)
+            report("Forward turn {}".format(i + 1), True, "new page (unique hash)")
+
+        if forward_ok:
+            for i in range(3):
+                _send_page_back(direction=direction)
+                time.sleep(1.0)
+            restored = wait_for_stable_frame(wid, timeout=3.0)
+            if restored == base:
+                report("Returned to original page", True)
+            else:
+                report("Returned to original page", False,
+                       "hash differs", warn=True)
 
     # ------------------------------------------------------------------
     # Summary

@@ -2,10 +2,12 @@
 """Kindle Capture — macOS CLI tool to capture Kindle book pages as PNG images."""
 
 import argparse
-import glob as _glob
+import glob
 import hashlib
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,6 +19,17 @@ try:
 except ImportError:
     print("Error: Quartz framework not available. This tool requires macOS.", file=sys.stderr)
     sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Constants — macOS virtual key codes
+# ---------------------------------------------------------------------------
+
+KEY_LEFT_ARROW = 123
+KEY_RIGHT_ARROW = 124
+KEY_SPACE = 49
+KEY_PAGE_UP = 116
+KEY_PAGE_DOWN = 121
 
 
 # ---------------------------------------------------------------------------
@@ -338,13 +351,56 @@ def wait_for_stable_frame(window_id, timeout=6.0, interval=0.4):
             return h
         prev_hash = h
         time.sleep(interval)
-    # Timeout: return the last hash we got (best effort)
-    return prev_hash
+    # Timeout — frame never stabilized. Return None instead of an unstable hash
+    # so callers can distinguish stable vs. unstable results.
+    return None
+
+
+def capture_stable_frame(window_id, timeout=6.0, interval=0.4):
+    """Like wait_for_stable_frame but keeps the temp file of the stable capture.
+
+    Returns (hash, temp_file_path) on success, or (None, None) on timeout.
+    The caller is responsible for cleaning up the temp file.
+
+    This eliminates the re-capture race condition: the saved file is the exact
+    same capture that was verified as stable.
+    """
+    prev_hash = None
+    prev_tmp = None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        tmp, h = capture_and_hash(window_id)
+        if h is None:
+            if tmp:
+                _safe_remove(tmp)
+            time.sleep(interval)
+            continue
+        if h == prev_hash:
+            # Stable! Return this capture. Discard the previous temp file.
+            if prev_tmp:
+                _safe_remove(prev_tmp)
+            return (h, tmp)
+        # Not stable yet. Discard previous, keep current for next comparison.
+        if prev_tmp:
+            _safe_remove(prev_tmp)
+        prev_hash = h
+        prev_tmp = tmp
+        time.sleep(interval)
+    # Timeout — clean up and return failure
+    if prev_tmp:
+        _safe_remove(prev_tmp)
+    return (None, None)
 
 
 # ---------------------------------------------------------------------------
-# Page turn
+# Page turn — navigation key probing and sending
 # ---------------------------------------------------------------------------
+
+# Navigation key state (set during probe_navigation_keys)
+_forward_key_code = None
+_backward_key_code = None
+_nav_key_name = None
+
 
 def activate_kindle():
     """Bring Kindle to foreground. No clicking — only activate."""
@@ -355,31 +411,207 @@ def activate_kindle():
     time.sleep(0.5)
 
 
-def send_page_turn(direction="rtl", verbose=False):
-    """Send a page-forward key to the Kindle process.
+def _send_key_to_kindle(key_code, verbose=False):
+    """Send a single key event to the Kindle process.
 
-    For RTL (right-to-left) books: left arrow (key code 123) = next page.
-    For LTR (left-to-right) books: right arrow (key code 124) = next page.
-
-    The key event is sent inside `tell process "Kindle"` to ensure it
-    reaches Kindle even if another app momentarily grabs focus.
+    Ensures Kindle is frontmost before sending the key.
     """
-    key_code = 123 if direction == "rtl" else 124
     script = '''
     tell application "System Events"
         tell process "Kindle"
             set frontmost to true
-            delay 0.3
+            delay 0.2
             key code {}
         end tell
     end tell
     '''.format(key_code)
     result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
     if verbose and result.returncode != 0:
-        print("\n  [debug] page turn osascript failed: {}".format(
-            result.stderr.strip()
-        ), file=sys.stderr)
+        print("\n  [debug] key code {} osascript failed: {}".format(
+            key_code, result.stderr.strip()), file=sys.stderr)
     return result.returncode == 0
+
+
+def _try_key_round_trip(window_id, fwd_key, bwd_key, base_hash, verbose=False):
+    """Test if fwd_key changes the page and bwd_key restores it.
+
+    Returns True if round-trip succeeds, False otherwise.
+    Always attempts to restore position to base_hash.
+    """
+    _send_key_to_kindle(fwd_key, verbose=False)
+    time.sleep(1.0)
+    h_fwd = wait_for_stable_frame(window_id, timeout=4.0)
+
+    if not h_fwd or h_fwd == base_hash:
+        return False  # Key didn't change page
+
+    # Forward worked. Try backward.
+    _send_key_to_kindle(bwd_key, verbose=False)
+    time.sleep(1.0)
+    h_back = wait_for_stable_frame(window_id, timeout=4.0)
+
+    if h_back == base_hash:
+        return True  # Round-trip OK
+
+    # Round-trip failed. Try harder to restore.
+    if verbose:
+        print(" (restoring...)", end="", flush=True)
+    for _i in range(3):
+        _send_key_to_kindle(bwd_key, verbose=False)
+        time.sleep(0.8)
+        h_check = wait_for_stable_frame(window_id, timeout=3.0)
+        if h_check == base_hash:
+            break
+    return False
+
+
+def probe_navigation_keys(window_id, direction="auto", verbose=False):
+    """Test navigation keys and select the best forward/backward pair.
+
+    Strategy:
+    1. If direction is 'rtl' or 'ltr': use arrow keys directly (no probe).
+    2. If direction is 'auto':
+       a. Try direction-independent keys (Space, Page Down) with round-trip.
+          These always mean "next page" regardless of book layout.
+       b. Try arrow keys with BOUNDARY DETECTION:
+          - If only one arrow changes the page, it must be the forward key
+            (the other hits the first/last page boundary).
+          - If both arrows change the page, direction is ambiguous and we
+            return None to force the user to specify --direction.
+
+    Returns (forward_key, backward_key, method_name) or None on failure.
+    """
+    global _forward_key_code, _backward_key_code, _nav_key_name
+
+    # Explicit direction: skip probing
+    if direction == "rtl":
+        _forward_key_code = KEY_LEFT_ARROW
+        _backward_key_code = KEY_RIGHT_ARROW
+        _nav_key_name = "Left Arrow (RTL)"
+        return (KEY_LEFT_ARROW, KEY_RIGHT_ARROW, _nav_key_name)
+
+    if direction == "ltr":
+        _forward_key_code = KEY_RIGHT_ARROW
+        _backward_key_code = KEY_LEFT_ARROW
+        _nav_key_name = "Right Arrow (LTR)"
+        return (KEY_RIGHT_ARROW, KEY_LEFT_ARROW, _nav_key_name)
+
+    # --- Auto-detection ---
+    base_hash = wait_for_stable_frame(window_id, timeout=4.0)
+    if not base_hash:
+        return None
+
+    # Phase 1: Direction-independent keys (round-trip is valid here because
+    # Space/PageDown always mean "next page" — no ambiguity).
+    independent_keys = [
+        (KEY_SPACE, KEY_PAGE_UP, "Space / Page Up"),
+        (KEY_PAGE_DOWN, KEY_PAGE_UP, "Page Down / Page Up"),
+    ]
+
+    for fwd, bwd, name in independent_keys:
+        if verbose:
+            print("  [probe] Testing {} ...".format(name), end="", flush=True)
+
+        if _try_key_round_trip(window_id, fwd, bwd, base_hash, verbose=verbose):
+            if verbose:
+                print(" OK", flush=True)
+            _forward_key_code = fwd
+            _backward_key_code = bwd
+            _nav_key_name = name
+            return (fwd, bwd, name)
+        else:
+            if verbose:
+                print(" no", flush=True)
+
+    # Phase 2: Arrow keys — boundary detection only.
+    # Round-trip testing CANNOT distinguish correct vs. wrong direction for
+    # arrow keys (both directions produce a successful round-trip in the
+    # middle of a book). Instead, test each arrow independently and use
+    # boundary detection: at the first page, the "backward" key does nothing.
+    if verbose:
+        print("  [probe] Testing arrow keys (boundary detection) ...", flush=True)
+
+    # Test left arrow
+    _send_key_to_kindle(KEY_LEFT_ARROW, verbose=False)
+    time.sleep(1.0)
+    h_left = wait_for_stable_frame(window_id, timeout=4.0)
+    left_changes = (h_left is not None and h_left != base_hash)
+
+    if left_changes:
+        _send_key_to_kindle(KEY_RIGHT_ARROW, verbose=False)
+        time.sleep(1.0)
+        wait_for_stable_frame(window_id, timeout=3.0)
+
+    # Test right arrow
+    _send_key_to_kindle(KEY_RIGHT_ARROW, verbose=False)
+    time.sleep(1.0)
+    h_right = wait_for_stable_frame(window_id, timeout=4.0)
+    right_changes = (h_right is not None and h_right != base_hash)
+
+    if right_changes:
+        _send_key_to_kindle(KEY_LEFT_ARROW, verbose=False)
+        time.sleep(1.0)
+        wait_for_stable_frame(window_id, timeout=3.0)
+
+    if verbose:
+        print("  [probe]   Left arrow changes page: {}".format(left_changes))
+        print("  [probe]   Right arrow changes page: {}".format(right_changes))
+
+    if left_changes and not right_changes:
+        # Only left arrow works → we're at the boundary where right arrow
+        # can't go further. Left arrow is the forward key → RTL.
+        if verbose:
+            print("  [probe]   Detected: RTL (left=forward, right=boundary)")
+        _forward_key_code = KEY_LEFT_ARROW
+        _backward_key_code = KEY_RIGHT_ARROW
+        _nav_key_name = "Left Arrow (RTL, auto-detected)"
+        return (KEY_LEFT_ARROW, KEY_RIGHT_ARROW, _nav_key_name)
+
+    if right_changes and not left_changes:
+        # Only right arrow works → LTR.
+        if verbose:
+            print("  [probe]   Detected: LTR (right=forward, left=boundary)")
+        _forward_key_code = KEY_RIGHT_ARROW
+        _backward_key_code = KEY_LEFT_ARROW
+        _nav_key_name = "Right Arrow (LTR, auto-detected)"
+        return (KEY_RIGHT_ARROW, KEY_LEFT_ARROW, _nav_key_name)
+
+    if left_changes and right_changes:
+        # Both arrows change the page → we're in the middle of the book.
+        # Cannot determine direction. Return None to require --direction.
+        if verbose:
+            print("  [probe]   AMBIGUOUS: both arrows change page")
+        return None
+
+    # Neither arrow changes the page
+    return None
+
+
+def _resolve_nav_key(forward, direction):
+    """Resolve the key code for a page turn.
+
+    Args:
+        forward: True for page-forward, False for page-backward.
+        direction: 'rtl' or 'ltr' fallback when probe result is unavailable.
+    """
+    if forward:
+        if _forward_key_code is not None:
+            return _forward_key_code
+        return KEY_LEFT_ARROW if direction == "rtl" else KEY_RIGHT_ARROW
+    else:
+        if _backward_key_code is not None:
+            return _backward_key_code
+        return KEY_RIGHT_ARROW if direction == "rtl" else KEY_LEFT_ARROW
+
+
+def send_page_turn(direction="rtl", verbose=False):
+    """Send a page-forward key to the Kindle process."""
+    return _send_key_to_kindle(_resolve_nav_key(True, direction), verbose=verbose)
+
+
+def _send_page_back(direction="rtl", verbose=False):
+    """Send a page-backward key to go back one page."""
+    return _send_key_to_kindle(_resolve_nav_key(False, direction), verbose=verbose)
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +637,6 @@ def get_last_opened_asin():
 
 
 def lookup_title_from_homefeed(asin):
-    import json
     path = os.path.expanduser(
         "~/Library/Containers/com.amazon.Lassen/Data/Library/Caches/homefeed.json"
     )
@@ -442,24 +673,26 @@ def parse_args():
 Examples:
   %(prog)s --title "My Book"
   %(prog)s --delay 1.0 --max-pages 50
-  %(prog)s --verbose                    # show debug output
+  %(prog)s --direction ltr            # for left-to-right books
+  %(prog)s --verbose                  # show debug output
         """,
     )
     parser.add_argument("--title", help="Book title (auto-detected if omitted)")
     parser.add_argument("--output", default="./captures",
                         help="Output directory (default: ./captures)")
-    parser.add_argument("--direction", choices=["rtl", "ltr"], default="rtl",
-                        help="Reading direction: rtl for vertical/manga, ltr for horizontal (default: rtl)")
+    parser.add_argument("--direction", choices=["auto", "rtl", "ltr"], default="auto",
+                        help="Reading direction: auto (probe keys), rtl (manga/vertical), "
+                             "ltr (horizontal) (default: auto)")
     parser.add_argument("--delay", type=float, default=0.8,
                         help="Base delay after page turn (default: 0.8)")
     parser.add_argument("--start-page", type=int, default=None,
                         help="Starting page number (auto-detected from existing files if omitted)")
     parser.add_argument("--max-pages", type=int, default=5000,
                         help="Max pages to capture (default: 5000)")
-    parser.add_argument("--end-retries", type=int, default=5,
-                        help="Retries before end-of-book (default: 5)")
-    parser.add_argument("--stable-timeout", type=float, default=6.0,
-                        help="Timeout for frame stabilization (default: 6.0)")
+    parser.add_argument("--end-retries", type=int, default=8,
+                        help="Retries before end-of-book (default: 8)")
+    parser.add_argument("--stable-timeout", type=float, default=8.0,
+                        help="Timeout for frame stabilization (default: 8.0)")
     parser.add_argument("--verbose", action="store_true",
                         help="Print debug information")
     return parser.parse_args()
@@ -469,7 +702,7 @@ Examples:
 # E2E pre-flight checks
 # ---------------------------------------------------------------------------
 
-def preflight_checks(window_id, direction="rtl", verbose=False):
+def preflight_checks(window_id, direction="auto", verbose=False):
     """Run diagnostics before starting capture. Returns True if OK."""
     ok = True
 
@@ -497,13 +730,21 @@ def preflight_checks(window_id, direction="rtl", verbose=False):
         # Not fatal — stabilization loop will handle this
 
     # Check 3: Does page turn change the content?
-    key_name = "left arrow" if direction == "rtl" else "right arrow"
+    if _nav_key_name:
+        key_name = _nav_key_name
+    elif direction == "rtl":
+        key_name = "left arrow"
+    elif direction == "ltr":
+        key_name = "right arrow"
+    else:
+        key_name = "probed key"
+
     print("  [check] Page turn ({}) ... ".format(key_name), end="", flush=True)
-    before_hash = wait_for_stable_frame(window_id, timeout=3.0)
+    before_hash = wait_for_stable_frame(window_id, timeout=4.0)
     send_page_turn(direction=direction, verbose=verbose)
     time.sleep(1.0)
-    after_hash = wait_for_stable_frame(window_id, timeout=3.0)
-    if before_hash != after_hash:
+    after_hash = wait_for_stable_frame(window_id, timeout=4.0)
+    if before_hash and after_hash and before_hash != after_hash:
         print("OK (content changed)")
         # Turn back to restore position
         _send_page_back(direction=direction, verbose=verbose)
@@ -515,33 +756,13 @@ def preflight_checks(window_id, direction="rtl", verbose=False):
         print("    - No book is open (you're on the library screen)")
         print("    - The reader view does not have keyboard focus")
         print("    - You're on the last page")
-        print("    - Wrong reading direction (try --direction ltr)")
+        if direction != "auto":
+            other = "ltr" if direction == "rtl" else "rtl"
+            print("    - Wrong reading direction (try --direction {})".format(other))
         print("\n  Please open a book in Kindle and try again.")
         ok = False
 
     return ok
-
-
-def _send_page_back(direction="rtl", verbose=False):
-    """Send a page-backward key to go back one page.
-
-    For RTL books: right arrow (key code 124) = previous page.
-    For LTR books: left arrow (key code 123) = previous page.
-    """
-    key_code = 124 if direction == "rtl" else 123
-    script = '''
-    tell application "System Events"
-        tell process "Kindle"
-            set frontmost to true
-            delay 0.3
-            key code {}
-        end tell
-    end tell
-    '''.format(key_code)
-    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    if verbose and result.returncode != 0:
-        print("\n  [debug] page back failed: {}".format(result.stderr.strip()),
-              file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -555,7 +776,7 @@ def detect_last_page(output_dir):
     Returns (last_page_number, last_file_path) or (0, None) if no files exist.
     """
     pattern = os.path.join(output_dir, "p[0-9]*.png")
-    files = _glob.glob(pattern)
+    files = glob.glob(pattern)
     if not files:
         return 0, None
     best_num = 0
@@ -611,9 +832,6 @@ def main():
     print("Found Kindle window: id={}, size={}x{}".format(
         window_id, window["width"], window["height"]
     ))
-    print("Reading direction: {} ({})".format(
-        direction, "right-to-left" if direction == "rtl" else "left-to-right"
-    ))
 
     # 2.5. Select capture method
     print("Selecting capture method ... ", end="", flush=True)
@@ -627,6 +845,33 @@ def main():
         print("  - Kindle window is minimized or fully behind other windows", file=sys.stderr)
         print("  - Screen recording permission was just granted (restart the terminal)", file=sys.stderr)
         sys.exit(1)
+
+    # 2.7. Activate Kindle before probing navigation keys
+    activate_kindle()
+
+    # 2.8. Probe navigation keys
+    print("Probing navigation keys ... ", end="", flush=True)
+    nav_result = probe_navigation_keys(window_id, direction=direction, verbose=args.verbose)
+    if nav_result:
+        fwd, bwd, nav_name = nav_result
+        print("OK ({})".format(nav_name))
+    else:
+        if direction == "auto":
+            print("FAIL")
+            print("\nCould not auto-detect page navigation direction.", file=sys.stderr)
+            print("Both arrow keys change the page, so direction is ambiguous.", file=sys.stderr)
+            print("", file=sys.stderr)
+            print("Please specify the reading direction explicitly:", file=sys.stderr)
+            print("  python3 kindle_capture.py --direction ltr   (horizontal/English books)",
+                  file=sys.stderr)
+            print("  python3 kindle_capture.py --direction rtl   (manga/vertical Japanese books)",
+                  file=sys.stderr)
+            print("", file=sys.stderr)
+            print("Tip: If you navigate Kindle to the FIRST page of the book,", file=sys.stderr)
+            print("     auto-detection can determine the direction automatically.", file=sys.stderr)
+            sys.exit(1)
+        else:
+            print("SKIP (using {} arrow keys)".format(direction.upper()))
 
     # 3. Title
     title = None
@@ -711,15 +956,24 @@ def main():
         print("Starting capture from page {} ... (Ctrl+C to stop)\n".format(
             page_num + 1))
     else:
-        # Save first page
+        # Save first page using stable frame capture
         print("Starting capture... (Ctrl+C to stop)\n")
         first_path = os.path.join(output_dir, "p{:04d}.png".format(page_num))
-        if not capture_window(window_id, first_path):
-            print("Error: Failed to save first page.", file=sys.stderr)
+        first_hash, first_tmp = capture_stable_frame(
+            window_id, timeout=args.stable_timeout
+        )
+        if first_hash is None or first_tmp is None:
+            print("Error: Could not capture first page.", file=sys.stderr)
             sys.exit(1)
-        saved_hash = pixel_hash(first_path)
-        if saved_hash is not None:
-            current_hash = saved_hash
+        try:
+            shutil.move(first_tmp, first_path)
+        except OSError:
+            _safe_remove(first_tmp)
+            if not capture_window(window_id, first_path):
+                print("Error: Failed to save first page.", file=sys.stderr)
+                sys.exit(1)
+            first_hash = pixel_hash(first_path)
+        current_hash = first_hash
         captured = 1
         sys.stdout.write("\rCaptured: {} pages".format(captured))
         sys.stdout.flush()
@@ -741,19 +995,18 @@ def main():
 
             prev_hash = current_hash
 
-            # --- Turn page ---
-            if not send_page_turn(direction=direction, verbose=args.verbose):
-                if args.verbose:
-                    print("\n  [debug] page turn command failed", file=sys.stderr)
-                # Try re-activating
-                activate_kindle()
-                send_page_turn(direction=direction, verbose=args.verbose)
+            # --- Turn page (single attempt — no retry to avoid double-turn) ---
+            # If the key event fails to reach Kindle, the page hash won't change,
+            # and the end-retry mechanism below will re-activate and try again.
+            send_page_turn(direction=direction, verbose=args.verbose)
 
             # Base delay for rendering to begin
             time.sleep(args.delay)
 
-            # --- Wait for stable frame ---
-            stable_hash = wait_for_stable_frame(
+            # --- Capture stable frame ---
+            # capture_stable_frame returns the exact file that was verified as
+            # stable, eliminating the re-capture race condition.
+            stable_hash, stable_path = capture_stable_frame(
                 window_id, timeout=args.stable_timeout
             )
 
@@ -766,11 +1019,14 @@ def main():
                         args.end_retries))
                     break
                 activate_kindle()
+                time.sleep(0.5 + end_retry_count * 0.3)
                 continue
 
             # --- Compare with previous page ---
             if stable_hash == prev_hash:
-                # Page didn't change
+                # Page didn't change. Could be: end of book, key not received,
+                # or transient focus loss.
+                _safe_remove(stable_path)
                 end_retry_count += 1
                 if end_retry_count >= args.end_retries:
                     print("\nEnd of book (page unchanged after {} retries).".format(
@@ -781,24 +1037,27 @@ def main():
                         "\r  [retry {}/{}] Page unchanged, retrying...    ".format(
                             end_retry_count, args.end_retries))
                     sys.stdout.flush()
-                # Re-activate and retry
+                # Re-activate Kindle and wait with progressive backoff
                 activate_kindle()
-                time.sleep(0.3)
+                time.sleep(0.5 + end_retry_count * 0.3)
                 continue
 
-            # --- Page changed: save ---
+            # --- Page changed: save the stable frame directly ---
             end_retry_count = 0
             page_num += 1
             filepath = os.path.join(output_dir, "p{:04d}.png".format(page_num))
 
-            if not capture_window(window_id, filepath):
-                print("\nError: Failed to save p{:04d}.png".format(page_num),
-                      file=sys.stderr)
-                break
+            try:
+                shutil.move(stable_path, filepath)
+            except OSError:
+                # Cross-filesystem move failed — fall back to re-capture
+                _safe_remove(stable_path)
+                if not capture_window(window_id, filepath):
+                    print("\nError: Failed to save p{:04d}.png".format(page_num),
+                          file=sys.stderr)
+                    break
 
-            # Use the hash of the actually saved file
-            final_hash = pixel_hash(filepath)
-            current_hash = final_hash if final_hash is not None else stable_hash
+            current_hash = stable_hash
 
             captured += 1
             sys.stdout.write("\rCaptured: {} pages (p{:04d}.png)".format(
