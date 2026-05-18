@@ -1012,6 +1012,16 @@ def main():
             # Base delay for rendering to begin
             time.sleep(args.delay)
 
+            # Dismiss end-of-book overlays (rating dialog, recommend popup, etc.)
+            # At the last page, Kindle shows a rating/recommendation popup whose
+            # pixels differ from the underlying page, tricking the hash comparison
+            # into saving it as a new page.  Pressing Escape closes the overlay so
+            # the underlying (unchanged) page is captured, allowing the
+            # "page unchanged" end-of-book detection to fire correctly.
+            # On normal pages this is a no-op.
+            _send_key_to_kindle(KEY_ESCAPE, verbose=args.verbose)
+            time.sleep(0.3)
+
             # --- Capture stable frame ---
             # capture_stable_frame returns the exact file that was verified as
             # stable, eliminating the re-capture race condition.
