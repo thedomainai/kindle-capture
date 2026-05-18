@@ -1041,11 +1041,10 @@ def main():
                     print("\nEnd of book (page unchanged after {} retries).".format(
                         args.end_retries))
                     break
-                if args.verbose:
-                    sys.stdout.write(
-                        "\r  [retry {}/{}] Page unchanged, retrying...    ".format(
-                            end_retry_count, args.end_retries))
-                    sys.stdout.flush()
+                sys.stdout.write(
+                    "\r  [retry {}/{}] Page unchanged, retrying...    ".format(
+                        end_retry_count, args.end_retries))
+                sys.stdout.flush()
                 # Re-activate Kindle and wait with progressive backoff
                 activate_kindle()
                 time.sleep(0.5 + end_retry_count * 0.3)
