@@ -30,6 +30,7 @@ KEY_RIGHT_ARROW = 124
 KEY_SPACE = 49
 KEY_PAGE_UP = 116
 KEY_PAGE_DOWN = 121
+KEY_ESCAPE = 53
 
 
 # ---------------------------------------------------------------------------
@@ -873,6 +874,13 @@ def main():
         else:
             print("SKIP (using {} arrow keys)".format(direction.upper()))
 
+    # 2.9. Dismiss Page Flip / "Back to X" overlays triggered by navigation probing.
+    # The probe sends page-forward/backward keys which causes Kindle to show a
+    # "Back to page N" widget. This widget can steal keyboard focus and prevent
+    # subsequent page-turn keys from reaching the reading view.
+    _send_key_to_kindle(KEY_ESCAPE, verbose=args.verbose)
+    time.sleep(0.3)
+
     # 3. Title
     title = None
     if args.title:
@@ -925,7 +933,8 @@ def main():
         sys.exit(1)
     print()
 
-    # Need to re-stabilize after preflight (which turns a page back)
+    # Dismiss overlays again (preflight also sends page-turn keys)
+    _send_key_to_kindle(KEY_ESCAPE, verbose=args.verbose)
     time.sleep(0.5)
 
     # Refresh window ID after preflight
