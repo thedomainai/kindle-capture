@@ -947,6 +947,7 @@ def main():
     # 7. Set up initial state
     captured = 0
     end_retry_count = 0
+    seen_hashes = set()  # All saved page hashes — detects A↔B oscillation at end-of-book
 
     # Get stable hash of current page
     current_hash = wait_for_stable_frame(window_id, timeout=args.stable_timeout)
@@ -962,6 +963,7 @@ def main():
             saved_hash = pixel_hash(last_file)
             if saved_hash is not None:
                 current_hash = saved_hash
+        seen_hashes.add(current_hash)
         print("Starting capture from page {} ... (Ctrl+C to stop)\n".format(
             page_num + 1))
     else:
@@ -983,6 +985,7 @@ def main():
                 sys.exit(1)
             first_hash = pixel_hash(first_path)
         current_hash = first_hash
+        seen_hashes.add(current_hash)
         captured = 1
         sys.stdout.write("\rCaptured: {} pages".format(captured))
         sys.stdout.flush()
@@ -1041,19 +1044,29 @@ def main():
                 time.sleep(0.5 + end_retry_count * 0.3)
                 continue
 
-            # --- Compare with previous page ---
-            if stable_hash == prev_hash:
-                # Page didn't change. Could be: end of book, key not received,
-                # or transient focus loss.
+            # --- Compare with previous page and all saved pages ---
+            # Two cases indicate no forward progress:
+            #   1. stable_hash == prev_hash: page didn't change (key miss, focus loss)
+            #   2. stable_hash in seen_hashes: page reverted to an already-captured
+            #      state (end-of-book oscillation: last page ↔ rating popup)
+            if stable_hash == prev_hash or stable_hash in seen_hashes:
                 _safe_remove(stable_path)
                 end_retry_count += 1
                 if end_retry_count >= args.end_retries:
-                    print("\nEnd of book (page unchanged after {} retries).".format(
-                        args.end_retries))
+                    if stable_hash != prev_hash:
+                        print("\nEnd of book (page cycling detected after {} retries).".format(
+                            args.end_retries))
+                    else:
+                        print("\nEnd of book (page unchanged after {} retries).".format(
+                            args.end_retries))
                     break
+                if stable_hash != prev_hash:
+                    reason = "Page already seen"
+                else:
+                    reason = "Page unchanged"
                 sys.stdout.write(
-                    "\r  [retry {}/{}] Page unchanged, retrying...    ".format(
-                        end_retry_count, args.end_retries))
+                    "\r  [retry {}/{}] {}, retrying...    ".format(
+                        end_retry_count, args.end_retries, reason))
                 sys.stdout.flush()
                 # Re-activate Kindle and wait with progressive backoff
                 activate_kindle()
@@ -1076,6 +1089,7 @@ def main():
                     break
 
             current_hash = stable_hash
+            seen_hashes.add(stable_hash)
 
             captured += 1
             sys.stdout.write("\rCaptured: {} pages (p{:04d}.png)".format(
