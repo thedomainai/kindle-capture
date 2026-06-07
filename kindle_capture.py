@@ -155,11 +155,11 @@ def _save_cgimage_to_png(cgimage, output_path):
     )
     if url is None:
         return False
-    dest = CG.CGImageDestinationCreateWithURL(url, "public.png", 1, None)
+    dest = Quartz.CGImageDestinationCreateWithURL(url, "public.png", 1, None)
     if dest is None:
         return False
-    CG.CGImageDestinationAddImage(dest, cgimage, None)
-    return bool(CG.CGImageDestinationFinalize(dest))
+    Quartz.CGImageDestinationAddImage(dest, cgimage, None)
+    return bool(Quartz.CGImageDestinationFinalize(dest))
 
 
 def _capture_via_cgimage(window_id, output_path):
@@ -822,7 +822,8 @@ def main():
         print("Error: Kindle is not running.", file=sys.stderr)
         sys.exit(1)
 
-    # 2. Window detection
+    # 2. Window detection (activate Kindle first to ensure visibility)
+    activate_kindle()
     window = find_kindle_window()
     if window is None:
         print("Error: Could not find Kindle window.", file=sys.stderr)

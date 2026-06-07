@@ -86,6 +86,8 @@ def main():
     # Test 2: Window detection
     # ------------------------------------------------------------------
     print("\n[2/9] Window detection")
+    activate_kindle()
+    time.sleep(0.5)
     window = find_kindle_window()
     if window:
         report("Window found", True,
